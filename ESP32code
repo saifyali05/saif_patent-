@@ -1,0 +1,252 @@
+#define BLYNK_TEMPLATE_ID "generate_yours"
+#define BLYNK_TEMPLATE_NAME "SMART ENERGY METER"
+#define BLYNK_AUTH_TOKEN "generate yours"
+
+#include <WiFi.h>
+#include <WiFiClient.h>
+#include <BlynkSimpleEsp32.h>
+#include <Wire.h>
+#include <ACS712.h>
+#include <ZMPT101B.h>
+#include <EEPROM.h>
+
+// WiFi credentials
+const char* ssid = "yous";
+const char* pass = "yours";
+
+// Blynk virtual pins select accordingly
+#define VPIN_VOLTAGE V0
+#define VPIN_CURRENT V1
+#define VPIN_POWER V2
+#define VPIN_ENERGY V3
+
+// Timer for non-blocking operations
+BlynkTimer timer;
+
+// Sensor pins and configuration
+#define CURRENT_SENSOR_PIN 34
+#define VOLTAGE_SENSOR_PIN 35
+
+// ACS712 sensor (adjust sensitivity based on your module: 5A=185, 20A=100, 30A=66)
+ACS712 ACS(CURRENT_SENSOR_PIN, 3.3, 4095, 100);  // Using 20A model by default
+
+// Voltage sensor
+ZMPT101B voltageSensor(VOLTAGE_SENSOR_PIN, 50.0);
+
+// Variables
+float unit = 0.0;  // Energy consumption in kWh
+int voltage = 0;    // Voltage reading
+float current = 0;  // Current reading
+float power = 0;   // Power calculation
+unsigned long previousMillis = 0;  // Time tracking for energy calculation
+
+// EEPROM configuration
+#define EEPROM_SIZE 512
+#define UNIT_ADDRESS 0
+
+// Status LED pin
+#define STATUS_LED 2
+
+// Function to read sensors and send data to Blynk
+void readAndSendSensors() {
+  // Record the time at the beginning of the function
+  unsigned long currentMillis = millis();
+  unsigned long elapsedTime = currentMillis - previousMillis;
+  previousMillis = currentMillis;
+
+  // Read voltage with averaging
+  float voltageReading = 0;
+  for (int i = 0; i < 30; i++) {
+    voltageReading += voltageSensor.getRmsVoltage();
+    delay(1);
+  }
+  voltageReading = voltageReading / 30.0;
+  voltage = (voltageReading > 20) ? (int)voltageReading : 0;  // Lower threshold to 20V
+
+  // Read current with extended averaging for better accuracy
+  float currentReading = 0;
+  for (int i = 0; i < 100; i++) {
+    currentReading += ACS.mA_AC();
+    delay(2);
+  }
+  current = currentReading / 100.0;  // Get average in mA
+
+  // Debug: Print raw current reading
+  Serial.print("Raw Current Reading: ");
+  Serial.println(currentReading);
+
+  // Calculate power in watts (convert mA to A)
+  power = voltage * (current / 3000.0);  // Convert current from mA to A
+
+  // Calculate time factor based on function interval in seconds
+  float timeFactor = elapsedTime / 1000.0;
+
+  // Calculate energy consumption (kWh)
+  if (power > 0) {
+    // Convert W to kWh considering the elapsed time
+    float kWh = (power * timeFactor) / 3600.0;
+    unit += kWh;
+  }
+// seriel monitor is optional
+  // Print debugging info to serial monitor
+  Serial.println("\n===== SENSOR READINGS =====");
+  Serial.print("Current (mA): ");
+  Serial.println(current, 2);
+  Serial.print("Voltage (V): ");
+  Serial.println(voltage);
+  Serial.print("Power (W): ");
+  Serial.println(power, 3);
+  Serial.print("Energy (kWh): ");
+  Serial.println(unit, 6);
+  Serial.println("===========================");
+
+  // Send data to Blynk if connected
+  if (Blynk.connected()) {
+    Blynk.virtualWrite(VPIN_VOLTAGE, voltage);
+    Blynk.virtualWrite(VPIN_CURRENT, current);
+    Blynk.virtualWrite(VPIN_POWER, power);
+    Blynk.virtualWrite(VPIN_ENERGY, unit);
+  }
+}
+
+// Function to check WiFi and Blynk connections
+void checkConnection() {
+  // Check WiFi status
+  if (WiFi.status() != WL_CONNECTED) {
+    static unsigned long lastReconnectAttempt = 0;
+    if (millis() - lastReconnectAttempt > 30000) {  // Try every 30 seconds
+      lastReconnectAttempt = millis();
+      Serial.println("WiFi disconnected. Reconnecting...");
+      WiFi.begin(ssid, pass);
+      digitalWrite(STATUS_LED, LOW);
+    }
+  } else {
+    // WiFi is connected, check Blynk
+    if (!Blynk.connected()) {
+      static unsigned long lastBlynkReconnect = 0;
+      if (millis() - lastBlynkReconnect > 10000) {  // Try every 10 seconds
+        lastBlynkReconnect = millis();
+        Serial.println("Reconnecting to Blynk...");
+        Blynk.connect();
+        digitalWrite(STATUS_LED, !digitalRead(STATUS_LED));  // Blink LED while reconnecting
+      }
+    } else {
+      digitalWrite(STATUS_LED, HIGH);  // Steady ON when everything connected
+    }
+  }
+}
+
+// Function to calibrate the current sensor
+void calibrateCurrentSensor() {
+  Serial.println("Calibrating current sensor...");
+  Serial.println("Make sure no current is flowing through the sensor!");
+  delay(3000);  // Wait for user to ensure no current
+
+  // Extended calibration process
+  long sum = 0;
+  int readings = 1000;  // Take many readings for better accuracy
+
+  for (int i = 0; i < readings; i++) {
+    sum += analogRead(CURRENT_SENSOR_PIN);
+    delay(1);
+  }
+
+  int midPoint = sum / readings;
+  ACS.setMidPoint(midPoint);
+
+  // Measure sensitivity
+  float sensitivity = 0;
+  for (int i = 0; i < readings; i++) {
+    sensitivity += ACS.mA_AC();
+    delay(1);
+  }
+  sensitivity /= readings;
+
+  Serial.print("Calibration complete. New midPoint: ");
+  Serial.println(midPoint);
+  Serial.print("Sensitivity: ");
+  Serial.println(sensitivity);
+  Serial.println("Current sensor is now calibrated.");
+}
+
+// Setup function
+void setup() {
+  Serial.begin(9600);
+  delay(1000);
+  Serial.println("\n====== Smart Energy Meter ======");
+
+  // Set up status LED
+  pinMode(STATUS_LED, OUTPUT);
+  digitalWrite(STATUS_LED, LOW);
+
+  // Initialize EEPROM
+  EEPROM.begin(EEPROM_SIZE);
+
+  // Load saved unit value from EEPROM
+  float savedUnit = EEPROM.readFloat(UNIT_ADDRESS);
+
+  if (!isnan(savedUnit) && savedUnit > 0) {
+    unit = savedUnit;
+    Serial.print("Loaded energy: ");
+    Serial.print(unit, 6);
+    Serial.println(" kWh");
+  }
+
+  // Initialize sensors with calibration
+  Serial.println("Initializing sensors...");
+
+  // Custom calibration for current sensor
+  calibrateCurrentSensor();
+
+  // Configure voltage sensor
+  voltageSensor.setSensitivity(500.0f);  // Adjust based on your calibration
+  Serial.println("Voltage sensor initialized");
+
+  // Connect to WiFi
+  Serial.print("Connecting to WiFi: ");
+  Serial.println(ssid);
+  WiFi.begin(ssid, pass);
+
+  // Blinking LED during connection
+  for (int i = 0; i < 20 && WiFi.status() != WL_CONNECTED; i++) {
+    digitalWrite(STATUS_LED, !digitalRead(STATUS_LED));
+    delay(500);
+    Serial.print("...");
+  }
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("WiFi connected!");
+    Serial.print("IP: ");
+    Serial.println(WiFi.localIP());
+
+    // Configure and connect to Blynk
+    Blynk.config(BLYNK_AUTH_TOKEN);
+    if (Blynk.connect(20)) {  // 20 second timeout
+      Serial.println("Connected to Blynk server!");
+      digitalWrite(STATUS_LED, HIGH);
+    } else {
+      Serial.println("Failed to connect to Blynk, will retry...");
+    }
+  } else {
+    Serial.println("WiFi connection failed, will retry in background");
+  }
+
+  // Initialize the previous time
+  previousMillis = millis();
+
+  // Set up timer functions
+  timer.setInterval(5000, readAndSendSensors);  // Read sensors every 5 seconds
+  timer.setInterval(15000, checkConnection);    // Check connection every 15 seconds
+
+  Serial.println("Setup complete - monitoring started!");
+}
+
+// Main loop function
+void loop() {
+  if (WiFi.status() == WL_CONNECTED) {
+    Blynk.run();
+  }
+  timer.run();
+  yield();  // Allow ESP32 to handle system tasks
+}
